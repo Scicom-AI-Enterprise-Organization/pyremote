@@ -2,8 +2,6 @@
 
 Pythonic remote code execution using decorators. Run code on remote servers as if it were local. 
 
-As long your local Python version matched with the remote, you are good to go!
-
 ## How to
 
 1. Install,
@@ -179,6 +177,7 @@ Checkout [examples/simple_numpy.py](examples/simple_numpy.py)
 ```python
 from pyremote import remote, UvConfig
 import numpy as np
+import sys
 
 @remote(
     "localhost", 
@@ -191,12 +190,46 @@ def compute():
     import numpy as np
     import pandas as pd
 
+    print('inside compute()', sys.version)
     df = pd.DataFrame({'name': ['a', 'b', 'c'], 'data': np.array([1, 2, 3])})
 
     return df
 
+@remote(
+    "localhost", 
+    "ubuntu", 
+    password="ubuntu123", 
+    uv=UvConfig(path="~/.venv-3.12", python_version="3.12"), 
+    dependencies=["numpy==1.26.4", "pandas==2.2.3"]
+)
+def compute2():
+    import numpy as np
+    import pandas as pd
+
+    print('inside compute2()', sys.version)
+    df = pd.DataFrame({'name': ['a', 'b', 'c'], 'data': np.array([1, 2, 3])})
+    
+    return df
+
 result = compute()
 print(result)
+result = compute2()
+print(result)
+```
+
+Output,
+
+```
+inside compute() 3.10.17 (main, Apr  9 2025, 08:54:15) [GCC 9.4.0]
+  name  data
+0    a     1
+1    b     2
+2    c     3
+inside compute2() 3.12.12 (main, Dec  9 2025, 19:02:36) [Clang 21.1.4 ]
+  name  data
+0    a     1
+1    b     2
+2    c     3
 ```
 
 Checkout [examples/simple_uv.py](examples/simple_uv.py)
