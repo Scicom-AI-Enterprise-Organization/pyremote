@@ -1,6 +1,8 @@
 # pyremote
 
-Pythonic remote code execution using decorators. Run code on remote servers as if it were local.
+Pythonic remote code execution using decorators. Run code on remote servers as if it were local. 
+
+As long your local Python version matched with the remote, you are good to go!
 
 ## How to
 
@@ -37,8 +39,6 @@ Computed: 20
 [1, 2, 3, 20]
 20
 ```
-
-You need to make sure Python versions are matched.
 
 ## API
 
@@ -174,8 +174,6 @@ Output,
 
 Checkout [examples/simple_numpy.py](examples/simple_numpy.py)
 
-Again, you need to make sure Python versions are matched.
-
 ### Use UV
 
 ```python
@@ -202,5 +200,3 @@ print(result)
 ```
 
 Checkout [examples/simple_uv.py](examples/simple_uv.py)
-
-Again, you need to make sure Python versions are matched.
