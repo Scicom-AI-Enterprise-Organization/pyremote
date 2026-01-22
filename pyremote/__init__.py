@@ -475,22 +475,43 @@ exec(script)
             get_pty=True,
         )
         
-        stdout_content = stdout.read().decode()
-        stderr_content = stderr.read().decode()
-        
+        channel = stdout.channel
         result_data = None
         output_lines = []
+        buffer = ""
         
-        for line in stdout_content.splitlines():
-            if line.startswith('__REMOTE_RESULT__:'):
-                result_encoded = line.split(':', 1)[1]
+        while not channel.exit_status_ready() or channel.recv_ready():
+            if channel.recv_ready():
+                chunk = channel.recv(4096).decode('utf-8', errors='replace')
+                buffer += chunk
+                
+                while '\n' in buffer:
+                    line, buffer = buffer.split('\n', 1)
+                    if line.startswith('__REMOTE_RESULT__:'):
+                        result_encoded = line.split(':', 1)[1]
+                        try:
+                            result_data = cloudpickle.loads(base64.b64decode(result_encoded))
+                        except Exception:
+                            pass
+                    else:
+                        output_lines.append(line)
+                        print(line, flush=True)
+            else:
+                import time
+                time.sleep(0.01)
+        
+        if buffer:
+            if buffer.startswith('__REMOTE_RESULT__:'):
+                result_encoded = buffer.split(':', 1)[1]
                 try:
                     result_data = cloudpickle.loads(base64.b64decode(result_encoded))
                 except Exception:
                     pass
             else:
-                output_lines.append(line)
+                output_lines.append(buffer)
+                print(buffer, flush=True)
         
+        stderr_content = stderr.read().decode()
         actual_stdout = '\n'.join(output_lines)
         if output_lines:
             actual_stdout += '\n'
@@ -643,8 +664,6 @@ if __name__ == "__main__":
             
             result = self._execute_remote(func, args, kwargs, captured_vars)
             
-            if result.stdout:
-                print(result.stdout, end='')
             if result.stderr:
                 print(result.stderr, file=sys.stderr, end='')
             
