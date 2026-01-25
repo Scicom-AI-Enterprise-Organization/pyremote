@@ -1,6 +1,6 @@
 # pyremote
 
-Pythonic remote code execution using decorators. Run code on remote servers as if it were local. 
+Pythonic remote code execution using decorators. Run code on remote servers as if it were local, support multiple Python versions at the same time!
 
 ## How to
 
