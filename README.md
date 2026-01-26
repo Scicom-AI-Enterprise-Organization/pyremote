@@ -54,6 +54,7 @@ def remote(
     dependencies: List[str] = None,
     python_path: Optional[str] = None,
     setup_commands: List[str] = None,
+    install_verbose: bool = False,
 ) -> Callable:
     """
     Decorator for remote Python function execution over SSH.
@@ -61,6 +62,26 @@ def remote(
     The decorated function will execute on the remote machine. Variables
     from the enclosing scope are automatically captured and modifications
     are synced back after execution.
+    
+    Note:
+        Cross-Python-version execution is supported! The function source code
+        is sent to the remote, so you can run Python 3.10 locally and execute
+        on a remote Python 3.12 environment.
+        
+        However, return values must be serializable across versions. For best
+        compatibility, return primitive types (dict, list, str, int, float).
+    
+    Note:
+        To reassign variables from outer scope, use `global` keyword:
+        
+            x = 10
+            
+            @remote(...)
+            def compute():
+                global x  # required for reassignment
+                x = x + 1
+        
+        Mutable objects (lists, dicts) can be modified in-place without `global`.
     
     Args:
         host: Remote hostname or IP
@@ -75,68 +96,28 @@ def remote(
         dependencies: List of pip packages to install on remote
         python_path: Override python interpreter path
         setup_commands: List of shell commands to run before execution
-    
-    Note:
-        To reassign variables from outer scope, use `global` keyword:
-        
-            x = 10
-            
-            @remote(...)
-            def compute():
-                global x  # required for reassignment
-                x = x + 1
-        
-        Mutable objects (lists, dicts) can be modified in-place without `global`.
+        install_verbose: If True, stream pip/uv install output to stdout in real-time
     
     Examples:
-        # basic usage
-        x = 10
-        y = [1, 2, 3]
-        
-        @remote("server.com", "user", password="pass")
-        def compute():
-            y.append(x * 2)  # in-place modification works
-            return x * 2
-        
-        result = compute()
-        print(y)  # [1, 2, 3, 20]
-        
-        
-        # with UV (auto-installs uv and creates venv)
+        # Cross-version execution (local 3.10, remote 3.12)
         @remote("server.com", "user", password="pass",
                 uv=UvConfig(path="~/.venv", python_version="3.12"),
-                dependencies=["numpy", "pandas"])
-        def process():
-            import numpy as np
-            import pandas as pd
-            return np.array([1, 2, 3])
-        
-        
-        # simple UV usage (uses defaults)
-        @remote("server.com", "user", password="pass",
-                uv="~/.venv",
                 dependencies=["numpy"])
         def compute():
             import numpy as np
-            return np.mean([1, 2, 3])
+            arr = np.array([1, 2, 3])
+            print(f"Running on Python {__import__('sys').version}")
+            return arr.tolist()  # return list for cross-version compatibility
         
+        result = compute()
         
-        # UV with specific Python version
+        # Stream installation output for large dependencies
         @remote("server.com", "user", password="pass",
-                uv=UvConfig(path=".venv", python_version="3.11"),
-                dependencies=["torch"])
+                dependencies=["torch", "transformers"],
+                install_verbose=True)
         def train():
             import torch
             return torch.cuda.is_available()
-        
-        
-        # standard venv
-        @remote("server.com", "user", password="pass",
-                venv="~/.venv",
-                dependencies=["requests"])
-        def fetch():
-            import requests
-            return requests.get("https://api.example.com").json()
     """
 ```
 

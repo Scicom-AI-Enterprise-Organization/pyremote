@@ -104,10 +104,12 @@ class RemoteExecutor:
         dependencies: List[str] = None,
         python_path: Optional[str] = None,
         setup_commands: List[str] = None,
+        install_verbose: bool = False,
     ):
         self.ssh_config = ssh_config
         self.dependencies = dependencies or []
         self.setup_commands = setup_commands or []
+        self.install_verbose = install_verbose
         
         if isinstance(venv, str):
             self.venv = VenvConfig(path=venv)
@@ -173,8 +175,14 @@ class RemoteExecutor:
             self._client.close()
             self._client = None
     
-    def _run_command(self, cmd: str, timeout: int = None) -> tuple:
-        """Run a command on remote and return exit_status, stdout, stderr."""
+    def _run_command(self, cmd: str, timeout: int = None, stream: bool = False) -> tuple:
+        """Run a command on remote and return exit_status, stdout, stderr.
+        
+        Args:
+            cmd: Command to execute
+            timeout: Command timeout in seconds
+            stream: If True, stream output to stdout in real-time
+        """
         timeout = timeout or self.ssh_config.timeout
         
         # for simple single-line commands, run directly
@@ -186,8 +194,55 @@ class RemoteExecutor:
             wrapped_cmd = f'echo {cmd_encoded} | base64 -d | bash -l'
         
         stdin, stdout, stderr = self._client.exec_command(wrapped_cmd, timeout=timeout)
-        exit_status = stdout.channel.recv_exit_status()
-        return exit_status, stdout.read().decode(), stderr.read().decode()
+        
+        if stream:
+            # stream output in real-time
+            import time
+            channel = stdout.channel
+            output_lines = []
+            error_lines = []
+            stdout_buffer = ""
+            stderr_buffer = ""
+            
+            while not channel.exit_status_ready() or channel.recv_ready() or channel.recv_stderr_ready():
+                if channel.recv_ready():
+                    chunk = channel.recv(4096).decode('utf-8', errors='replace')
+                    stdout_buffer += chunk
+                    
+                    while '\n' in stdout_buffer:
+                        line, stdout_buffer = stdout_buffer.split('\n', 1)
+                        output_lines.append(line)
+                        print(line, flush=True)
+                
+                if channel.recv_stderr_ready():
+                    chunk = channel.recv_stderr(4096).decode('utf-8', errors='replace')
+                    stderr_buffer += chunk
+                    
+                    while '\n' in stderr_buffer:
+                        line, stderr_buffer = stderr_buffer.split('\n', 1)
+                        error_lines.append(line)
+                        print(line, file=sys.stderr, flush=True)
+                
+                if not channel.recv_ready() and not channel.recv_stderr_ready():
+                    time.sleep(0.01)
+            
+            # handle remaining buffer
+            if stdout_buffer:
+                output_lines.append(stdout_buffer)
+                print(stdout_buffer, flush=True)
+            if stderr_buffer:
+                error_lines.append(stderr_buffer)
+                print(stderr_buffer, file=sys.stderr, flush=True)
+            
+            exit_status = channel.recv_exit_status()
+            stdout_content = '\n'.join(output_lines)
+            stderr_content = '\n'.join(error_lines)
+        else:
+            exit_status = stdout.channel.recv_exit_status()
+            stdout_content = stdout.read().decode()
+            stderr_content = stderr.read().decode()
+        
+        return exit_status, stdout_content, stderr_content
     
     def _setup_uv(self):
         if not self.uv:
@@ -218,7 +273,9 @@ class RemoteExecutor:
                 )
             
             install_cmd = 'curl -LsSf https://astral.sh/uv/install.sh | sh'
-            exit_status, stdout, stderr = self._run_command(install_cmd, timeout=120)
+            exit_status, stdout, stderr = self._run_command(
+                install_cmd, timeout=120, stream=self.install_verbose
+            )
             
             if exit_status != 0:
                 raise RemoteVenvError(f"Failed to install UV: {stderr}")
@@ -237,7 +294,9 @@ class RemoteExecutor:
                 source $HOME/.local/bin/env 2>/dev/null || true
                 uv venv {python_opt} --allow-existing {uv_path}
             '''
-            exit_status, stdout, stderr = self._run_command(create_cmd, timeout=180)
+            exit_status, stdout, stderr = self._run_command(
+                create_cmd, timeout=180, stream=self.install_verbose
+            )
             
             if exit_status != 0:
                 raise RemoteVenvError(
@@ -249,7 +308,9 @@ class RemoteExecutor:
                 source {self.uv.activate_path}
                 uv pip install cloudpickle
             '''
-            exit_status, stdout, stderr = self._run_command(pip_cmd, timeout=120)
+            exit_status, stdout, stderr = self._run_command(
+                pip_cmd, timeout=120, stream=self.install_verbose
+            )
             
             if exit_status != 0:
                 raise RemoteVenvError(
@@ -287,15 +348,19 @@ class RemoteExecutor:
                 )
             
             create_cmd = f'{self.venv.python_base} -m venv {venv_path}'
-            exit_status, stdout, stderr = self._run_command(create_cmd, timeout=120)
+            exit_status, stdout, stderr = self._run_command(
+                create_cmd, timeout=120, stream=self.install_verbose
+            )
             
             if exit_status != 0:
                 raise RemoteVenvError(
                     f"Failed to create virtual environment at {venv_path}: {stderr}"
                 )
             
-            pip_cmd = f'{self.venv.pip_path} install --quiet cloudpickle'
-            exit_status, stdout, stderr = self._run_command(pip_cmd, timeout=120)
+            pip_cmd = f'{self.venv.pip_path} install cloudpickle'
+            exit_status, stdout, stderr = self._run_command(
+                pip_cmd, timeout=120, stream=self.install_verbose
+            )
             
             if exit_status != 0:
                 raise RemoteVenvError(
@@ -323,11 +388,13 @@ class RemoteExecutor:
                 uv pip install {deps_str}
             '''
         elif self.venv:
-            cmd = f'{self.venv.pip_path} install --quiet {deps_str}'
+            cmd = f'{self.venv.pip_path} install {deps_str}'
         else:
-            cmd = f'{self._python_path} -m pip install --quiet {deps_str}'
+            cmd = f'{self._python_path} -m pip install {deps_str}'
         
-        exit_status, stdout, stderr = self._run_command(cmd, timeout=300)
+        exit_status, stdout, stderr = self._run_command(
+            cmd, timeout=300, stream=self.install_verbose
+        )
         
         if exit_status != 0:
             raise RemoteImportError(
@@ -691,6 +758,7 @@ def remote(
     dependencies: List[str] = None,
     python_path: Optional[str] = None,
     setup_commands: List[str] = None,
+    install_verbose: bool = False,
 ) -> Callable:
     """
     Decorator for remote Python function execution over SSH.
@@ -732,6 +800,7 @@ def remote(
         dependencies: List of pip packages to install on remote
         python_path: Override python interpreter path
         setup_commands: List of shell commands to run before execution
+        install_verbose: If True, stream pip/uv install output to stdout in real-time
     
     Examples:
         # Cross-version execution (local 3.10, remote 3.12)
@@ -745,6 +814,14 @@ def remote(
             return arr.tolist()  # return list for cross-version compatibility
         
         result = compute()
+        
+        # Stream installation output for large dependencies
+        @remote("server.com", "user", password="pass",
+                dependencies=["torch", "transformers"],
+                install_verbose=True)
+        def train():
+            import torch
+            return torch.cuda.is_available()
     """
     ssh_config = SSHConfig(
         host=host,
@@ -763,6 +840,7 @@ def remote(
         dependencies=dependencies,
         python_path=python_path,
         setup_commands=setup_commands,
+        install_verbose=install_verbose,
     )
     
     def decorator(func: Callable) -> Callable:

@@ -6,8 +6,9 @@ import sys
     "localhost", 
     "ubuntu", 
     password="ubuntu123", 
-    uv=UvConfig(path="~/.venv-3.10", python_version="3.10.17", install_uv=True), 
-    dependencies=["numpy==1.26.4", "pandas==2.2.3"]
+    uv=UvConfig(path="~/.venv-3.10-v2", python_version="3.10.17", install_uv=True), 
+    dependencies=["numpy==1.26.4", "pandas==2.2.3"],
+    install_verbose=True,
 )
 def compute():
     import numpy as np
@@ -22,8 +23,9 @@ def compute():
     "localhost", 
     "ubuntu", 
     password="ubuntu123", 
-    uv=UvConfig(path="~/.venv-3.12", python_version="3.12", install_uv=True), 
-    dependencies=["numpy==1.26.4", "pandas==2.2.3"]
+    uv=UvConfig(path="~/.venv-3.12-v2", python_version="3.12", install_uv=True), 
+    dependencies=["numpy==1.26.4", "pandas==2.2.3"],
+    install_verbose=True,
 )
 def compute2():
     import numpy as np
