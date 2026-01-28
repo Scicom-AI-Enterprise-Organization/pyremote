@@ -259,3 +259,79 @@ inside compute2() 3.12.12 (main, Dec  9 2025, 19:02:36) [Clang 21.1.4 ]
 ```
 
 Checkout [examples/simple_uv.py](examples/simple_uv.py)
+
+### Stdout callback
+
+```python
+from pyremote import remote, UvConfig
+
+logs = []
+
+def log_handler(line: str):
+    """Callback that receives each line of stdout as it streams."""
+    logs.append(line)
+    # You could also send to logging, websocket, database, etc.
+    # Example: logger.info(line)
+    # Example: websocket.send(line)
+
+@remote(
+    "localhost", 
+    "ubuntu", 
+    password="ubuntu123",
+    uv=UvConfig(path="~/.venv", python_version="3.12"),
+    timeout=60,
+    stdout_callback=log_handler,
+)
+def task_with_logging():
+    import time
+    import sys
+    
+    print(f"Python version: {sys.version}")
+    print("Starting task...")
+    
+    for i in range(5):
+        print(f"Processing step {i+1}/5")
+        time.sleep(1)
+    
+    print("Task completed!")
+    return {"status": "completed", "steps": 5}
+
+if __name__ == "__main__":
+    result = task_with_logging()
+    
+    print("\n--- Captured Logs ---")
+    for log in logs:
+        print(f"  > {log}")
+    
+    print(f"\nResult: {result}")
+    print(f"Total log lines captured: {len(logs)}")
+
+```
+
+Output,
+
+```
+Python version: 3.10.17 (main, Apr  9 2025, 08:54:15) [GCC 9.4.0]
+Starting task...
+Processing step 1/5
+Processing step 2/5
+Processing step 3/5
+Processing step 4/5
+Processing step 5/5
+Task completed!
+
+--- Captured Logs ---
+  > Python version: 3.10.17 (main, Apr  9 2025, 08:54:15) [GCC 9.4.0]
+  > Starting task...
+  > Processing step 1/5
+  > Processing step 2/5
+  > Processing step 3/5
+  > Processing step 4/5
+  > Processing step 5/5
+  > Task completed!
+
+Result: {'status': 'completed', 'steps': 5}
+Total log lines captured: 8
+```
+
+Checkout [examples/simple_stdout_callback.py](examples/simple_stdout_callback.py)
