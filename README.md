@@ -55,6 +55,7 @@ def remote(
     python_path: Optional[str] = None,
     setup_commands: List[str] = None,
     install_verbose: bool = False,
+    stdout_callback: Optional[Callable[[str], None]] = None,
 ) -> Callable:
     """
     Decorator for remote Python function execution over SSH.
@@ -97,6 +98,9 @@ def remote(
         python_path: Override python interpreter path
         setup_commands: List of shell commands to run before execution
         install_verbose: If True, stream pip/uv install output to stdout in real-time
+        stdout_callback: Optional callback function that receives each line of
+            stdout output as it streams from the remote. Useful for real-time
+            logging, progress tracking, or capturing output without printing.
     
     Examples:
         # Cross-version execution (local 3.10, remote 3.12)
