@@ -105,11 +105,13 @@ class RemoteExecutor:
         python_path: Optional[str] = None,
         setup_commands: List[str] = None,
         install_verbose: bool = False,
+        stdout_callback: Optional[Callable[[str], None]] = None,
     ):
         self.ssh_config = ssh_config
         self.dependencies = dependencies or []
         self.setup_commands = setup_commands or []
         self.install_verbose = install_verbose
+        self.stdout_callback = stdout_callback
         
         if isinstance(venv, str):
             self.venv = VenvConfig(path=venv)
@@ -563,6 +565,8 @@ exec(script)
                     else:
                         output_lines.append(line)
                         print(line, flush=True)
+                        if self.stdout_callback:
+                            self.stdout_callback(line)
             else:
                 import time
                 time.sleep(0.01)
@@ -577,6 +581,8 @@ exec(script)
             else:
                 output_lines.append(buffer)
                 print(buffer, flush=True)
+                if self.stdout_callback:
+                    self.stdout_callback(buffer)
         
         stderr_content = stderr.read().decode()
         actual_stdout = '\n'.join(output_lines)
@@ -759,6 +765,7 @@ def remote(
     python_path: Optional[str] = None,
     setup_commands: List[str] = None,
     install_verbose: bool = False,
+    stdout_callback: Optional[Callable[[str], None]] = None,
 ) -> Callable:
     """
     Decorator for remote Python function execution over SSH.
@@ -801,6 +808,9 @@ def remote(
         python_path: Override python interpreter path
         setup_commands: List of shell commands to run before execution
         install_verbose: If True, stream pip/uv install output to stdout in real-time
+        stdout_callback: Optional callback function that receives each line of
+            stdout output as it streams from the remote. Useful for real-time
+            logging, progress tracking, or capturing output without printing.
     
     Examples:
         # Cross-version execution (local 3.10, remote 3.12)
@@ -841,6 +851,7 @@ def remote(
         python_path=python_path,
         setup_commands=setup_commands,
         install_verbose=install_verbose,
+        stdout_callback=stdout_callback,
     )
     
     def decorator(func: Callable) -> Callable:
