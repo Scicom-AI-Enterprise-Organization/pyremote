@@ -347,7 +347,7 @@ Checkout [examples/simple_stdout_callback.py](examples/simple_stdout_callback.py
 
 ### DPP Multi-GPUs
 
-```
+```python
 from pyremote import remote, UvConfig
 
 @remote(
