@@ -2,6 +2,17 @@
 
 Pythonic remote code execution using decorators. Run code on remote servers as if it were local, and support multiple Python versions at the same time!
 
+## Features
+
+1. Seamless Remote Execution, execute Python functions on remote servers using simple decorators.
+2. Flexible Authentication, support for SSH password, key-based authentication, and key passphrases.
+3. Multiple Python Versions, run different Python versions simultaneously using virtual environments or uv.
+4. Automatic Dependency Management, auto-install pip packages on remote servers.
+5. Variable State Synchronization, automatically sync global variables between local and remote execution.
+6. Multi-GPU Support, built-in distributed training with PyTorch using multi-processing.
+7. Real-time Output Streaming, stream stdout/stderr with custom callbacks.
+8. Environment Variable Control, set remote environment variables per function.
+
 ## How to
 
 1. Install,
