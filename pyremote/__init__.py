@@ -43,6 +43,7 @@ class SSHConfig:
     key_filename: Optional[str] = None
     key_password: Optional[str] = None
     timeout: int = 30
+    env: Optional[Dict[str, str]] = None  # Environment variables
 
 
 @dataclass
@@ -86,6 +87,25 @@ class UvConfig:
         return f"{self.path}/bin/activate"
 
 
+@dataclass
+class MultiprocessingConfig:
+    """Configuration for multi-GPU/multi-process distributed execution.
+    
+    Args:
+        num_processes: Number of processes to spawn. Use "auto" to detect GPU count,
+                      or an integer for explicit count.
+        master_addr: Address for distributed communication (default: localhost)
+        master_port: Port for distributed communication (default: 29500)
+        backend: Distributed backend - "nccl" for GPU, "gloo" for CPU (default: nccl)
+        start_method: Multiprocessing start method - "spawn", "fork", or "forkserver"
+    """
+    num_processes: Union[int, Literal["auto"]] = "auto"
+    master_addr: str = "localhost"
+    master_port: int = 29500
+    backend: str = "nccl"
+    start_method: str = "spawn"
+
+
 @dataclass 
 class RemoteResult:
     stdout: str
@@ -106,12 +126,27 @@ class RemoteExecutor:
         setup_commands: List[str] = None,
         install_verbose: bool = False,
         stdout_callback: Optional[Callable[[str], None]] = None,
+        multiprocessing: Optional[Union[int, Literal["auto"], MultiprocessingConfig]] = None,
+        env: Optional[Dict[str, str]] = None,
     ):
         self.ssh_config = ssh_config
         self.dependencies = dependencies or []
         self.setup_commands = setup_commands or []
         self.install_verbose = install_verbose
         self.stdout_callback = stdout_callback
+        self.env = env or {}
+        
+        # Handle multiprocessing config
+        if multiprocessing is None:
+            self.mp_config = None
+        elif isinstance(multiprocessing, int):
+            self.mp_config = MultiprocessingConfig(num_processes=multiprocessing)
+        elif multiprocessing == "auto":
+            self.mp_config = MultiprocessingConfig(num_processes="auto")
+        elif isinstance(multiprocessing, MultiprocessingConfig):
+            self.mp_config = multiprocessing
+        else:
+            self.mp_config = None
         
         if isinstance(venv, str):
             self.venv = VenvConfig(path=venv)
@@ -178,27 +213,18 @@ class RemoteExecutor:
             self._client = None
     
     def _run_command(self, cmd: str, timeout: int = None, stream: bool = False) -> tuple:
-        """Run a command on remote and return exit_status, stdout, stderr.
-        
-        Args:
-            cmd: Command to execute
-            timeout: Command timeout in seconds
-            stream: If True, stream output to stdout in real-time
-        """
+        """Run a command on remote and return exit_status, stdout, stderr."""
         timeout = timeout or self.ssh_config.timeout
         
-        # for simple single-line commands, run directly
         if '\n' not in cmd.strip():
             wrapped_cmd = f"bash -l -c '{cmd}'"
         else:
-            # for multi-line commands, use base64 encoding
             cmd_encoded = base64.b64encode(cmd.encode()).decode()
             wrapped_cmd = f'echo {cmd_encoded} | base64 -d | bash -l'
         
         stdin, stdout, stderr = self._client.exec_command(wrapped_cmd, timeout=timeout)
         
         if stream:
-            # stream output in real-time
             import time
             channel = stdout.channel
             output_lines = []
@@ -228,7 +254,6 @@ class RemoteExecutor:
                 if not channel.recv_ready() and not channel.recv_stderr_ready():
                     time.sleep(0.01)
             
-            # handle remaining buffer
             if stdout_buffer:
                 output_lines.append(stdout_buffer)
                 print(stdout_buffer, flush=True)
@@ -459,7 +484,6 @@ class RemoteExecutor:
             source = inspect.getsource(func)
             lines = source.split('\n')
             
-            # find the function definition line (skip decorators)
             func_start = 0
             for i, line in enumerate(lines):
                 stripped = line.strip()
@@ -469,7 +493,6 @@ class RemoteExecutor:
             
             func_lines = lines[func_start:]
             
-            # dedent
             if func_lines:
                 min_indent = float('inf')
                 for line in func_lines:
@@ -492,22 +515,33 @@ class RemoteExecutor:
         
         func_source = self._get_function_source(func)
         
+        # Convert mp_config to plain dict to avoid pickle issues on remote
+        mp_config_dict = None
+        if self.mp_config is not None:
+            mp_config_dict = {
+                'num_processes': self.mp_config.num_processes,
+                'master_addr': self.mp_config.master_addr,
+                'master_port': self.mp_config.master_port,
+                'backend': self.mp_config.backend,
+                'start_method': self.mp_config.start_method,
+            }
+        
         payload = {
             'func_source': func_source,
             'func_name': func.__name__,
             'args': args,
             'kwargs': kwargs,
             'captured_vars': captured_vars,
+            'mp_config': mp_config_dict,
+            'env': self.env,
         }
         
-        # only include func object if we couldn't get source (fallback)
         if func_source is None:
             payload['func'] = func
         
         payload_encoded = base64.b64encode(cloudpickle.dumps(payload)).decode()
         
         executor_script = self._build_executor_script()
-        script_encoded = base64.b64encode(executor_script.encode()).decode()
         
         if self.uv:
             activate_cmd = f'source $HOME/.local/bin/env 2>/dev/null || true && source {self.uv.activate_path}'
@@ -519,8 +553,35 @@ class RemoteExecutor:
             activate_cmd = ''
             python_cmd = self._python_path
         
-        if activate_cmd:
-            remote_cmd = f'''bash -c '
+        # For multiprocessing, we need to write the script to a file
+        # so that spawn can properly import worker_fn
+        if self.mp_config is not None:
+            # Write script to temp file on remote
+            script_b64 = base64.b64encode(executor_script.encode()).decode()
+            
+            write_script_cmd = f'''
+echo "{script_b64}" | base64 -d > /tmp/_pyremote_executor.py
+'''
+            exit_status, _, stderr = self._run_command(write_script_cmd)
+            if exit_status != 0:
+                raise RemoteExecutionError(f"Failed to write executor script: {stderr}")
+            
+            if activate_cmd:
+                remote_cmd = f'''bash -c '
+{activate_cmd} && {python_cmd} /tmp/_pyremote_executor.py "{payload_encoded}"
+'
+'''
+            else:
+                remote_cmd = f'''bash -c '
+{python_cmd} /tmp/_pyremote_executor.py "{payload_encoded}"
+'
+'''
+        else:
+            # For non-multiprocessing, we can use exec() as before
+            script_encoded = base64.b64encode(executor_script.encode()).decode()
+            
+            if activate_cmd:
+                remote_cmd = f'''bash -c '
 {activate_cmd} && {python_cmd} -c "
 import base64, sys
 script = base64.b64decode(\\"{script_encoded}\\").decode()
@@ -528,8 +589,8 @@ exec(script)
 " "{payload_encoded}"
 '
 '''
-        else:
-            remote_cmd = f'''bash -c '
+            else:
+                remote_cmd = f'''bash -c '
 {python_cmd} -c "
 import base64, sys
 script = base64.b64decode(\\"{script_encoded}\\").decode()
@@ -611,10 +672,61 @@ exec(script)
         )
     
     def _build_executor_script(self) -> str:
-        return '''
+        return '''#!/usr/bin/env python3
 import sys
 import base64
 import traceback
+import os
+import types
+
+def worker_fn(rank, world_size, func_source, func_name, args, kwargs, captured_vars, result_queue, backend, env_vars):
+    """Worker function that runs on each process."""
+    import torch
+    import torch.distributed as dist
+    
+    try:
+        # Set environment variables (need to do this in each worker)
+        for key, value in env_vars.items():
+            os.environ[key] = str(value)
+        
+        # Initialize distributed
+        os.environ['RANK'] = str(rank)
+        os.environ['LOCAL_RANK'] = str(rank)
+        os.environ['WORLD_SIZE'] = str(world_size)
+        
+        dist.init_process_group(
+            backend=backend,
+            rank=rank,
+            world_size=world_size,
+        )
+        
+        if torch.cuda.is_available():
+            torch.cuda.set_device(rank)
+        
+        # Recreate the function in this process
+        exec_globals = {'__builtins__': __builtins__}
+        exec_globals.update(captured_vars)
+        exec(func_source, exec_globals)
+        user_func = exec_globals[func_name]
+        
+        # Call user function WITHOUT injecting rank/world_size
+        # User can access via:
+        #   - os.environ['RANK'], os.environ['LOCAL_RANK'], os.environ['WORLD_SIZE']
+        #   - torch.distributed.get_rank(), torch.distributed.get_world_size()
+        worker_result = user_func(*args, **kwargs)
+        
+        # Only rank 0 returns the result
+        if rank == 0:
+            result_queue.put(('success', worker_result))
+        
+        dist.destroy_process_group()
+        
+    except Exception as e:
+        if rank == 0:
+            import traceback
+            traceback.print_exc()
+            result_queue.put(('error', e))
+        raise
 
 def main():
     import cloudpickle
@@ -628,6 +740,12 @@ def main():
     args = payload['args']
     kwargs = payload['kwargs']
     captured_vars = payload['captured_vars']
+    mp_config = payload.get('mp_config')
+    env_vars = payload.get('env', {})
+    
+    # Set environment variables
+    for key, value in env_vars.items():
+        os.environ[key] = str(value)
     
     result = {
         'return_value': None,
@@ -635,28 +753,24 @@ def main():
         'exception': None,
     }
     
-    # prepare execution namespace with captured variables
     exec_globals = {'__builtins__': __builtins__}
     exec_globals.update(captured_vars)
     
     try:
         if func_source:
-            # use source code (cross-version compatible)
             exec(func_source, exec_globals)
-            new_func = exec_globals[func_name]
+            user_func = exec_globals[func_name]
         elif func:
-            # fallback to cloudpickle function (same Python version only)
-            import types
             func_globals = dict(func.__globals__)
             func_globals.update(captured_vars)
-            new_func = types.FunctionType(
+            user_func = types.FunctionType(
                 func.__code__,
                 func_globals,
                 func.__name__,
                 func.__defaults__,
                 func.__closure__
             )
-            new_func.__kwdefaults__ = func.__kwdefaults__
+            user_func.__kwdefaults__ = func.__kwdefaults__
             exec_globals = func_globals
         else:
             raise RuntimeError("No function source or function object provided")
@@ -667,29 +781,102 @@ def main():
         print(f"__REMOTE_RESULT__:{result_encoded}")
         return
     
-    try:
-        result['return_value'] = new_func(*args, **kwargs)
-        
-        # capture all variables that might have been modified
-        for var in captured_vars.keys():
-            if var in exec_globals:
+    # Check if multiprocessing is enabled
+    if mp_config is not None:
+        try:
+            import torch
+            import torch.multiprocessing as mp
+            
+            # Determine number of processes
+            num_procs = mp_config['num_processes']
+            if num_procs == "auto":
+                if torch.cuda.is_available():
+                    num_procs = torch.cuda.device_count()
+                else:
+                    num_procs = os.cpu_count() or 1
+            
+            backend = mp_config['backend']
+            master_addr = mp_config['master_addr']
+            master_port = mp_config['master_port']
+            start_method = mp_config['start_method']
+            
+            print(f"[pyremote] Starting {num_procs} processes (backend={backend})")
+            
+            # Set environment variables for distributed
+            os.environ['MASTER_ADDR'] = master_addr
+            os.environ['MASTER_PORT'] = str(master_port)
+            
+            # Filter out non-picklable items from captured_vars for multiprocessing
+            mp_captured_vars = {}
+            for k, v in captured_vars.items():
+                if isinstance(v, types.ModuleType):
+                    continue  # Skip modules
                 try:
-                    val = exec_globals[var]
-                    cloudpickle.dumps(val)
-                    result['modified_vars'][var] = val
+                    import cloudpickle
+                    cloudpickle.dumps(v)
+                    mp_captured_vars[k] = v
                 except Exception:
-                    pass
-                        
-    except Exception as e:
-        result['exception'] = e
-        for var in captured_vars.keys():
-            if var in exec_globals:
-                try:
-                    val = exec_globals[var]
-                    cloudpickle.dumps(val)
-                    result['modified_vars'][var] = val
-                except Exception:
-                    pass
+                    pass  # Skip non-picklable items
+            
+            # Shared storage for results from rank 0
+            mp_context = mp.get_context(start_method)
+            result_queue = mp_context.Queue()
+            
+            # Spawn workers using module-level worker_fn
+            processes = []
+            
+            for rank in range(num_procs):
+                p = mp_context.Process(
+                    target=worker_fn,
+                    args=(rank, num_procs, func_source, func_name, args, kwargs, 
+                          mp_captured_vars, result_queue, backend, env_vars)
+                )
+                p.start()
+                processes.append(p)
+            
+            # Wait for all processes
+            for p in processes:
+                p.join()
+            
+            # Get result from rank 0
+            if not result_queue.empty():
+                status, value = result_queue.get()
+                if status == 'success':
+                    result['return_value'] = value
+                else:
+                    result['exception'] = value
+            else:
+                result['exception'] = RuntimeError("No result returned from rank 0")
+                
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            result['exception'] = e
+    
+    else:
+        # Normal single-process execution
+        try:
+            result['return_value'] = user_func(*args, **kwargs)
+            
+            for var in captured_vars.keys():
+                if var in exec_globals:
+                    try:
+                        val = exec_globals[var]
+                        cloudpickle.dumps(val)
+                        result['modified_vars'][var] = val
+                    except Exception:
+                        pass
+                            
+        except Exception as e:
+            result['exception'] = e
+            for var in captured_vars.keys():
+                if var in exec_globals:
+                    try:
+                        val = exec_globals[var]
+                        cloudpickle.dumps(val)
+                        result['modified_vars'][var] = val
+                    except Exception:
+                        pass
     
     result_encoded = base64.b64encode(cloudpickle.dumps(result)).decode()
     print(f"__REMOTE_RESULT__:{result_encoded}")
@@ -766,33 +953,12 @@ def remote(
     setup_commands: List[str] = None,
     install_verbose: bool = False,
     stdout_callback: Optional[Callable[[str], None]] = None,
+    multiprocessing: Optional[Union[int, Literal["auto"], MultiprocessingConfig]] = None,
+    env: Optional[Dict[str, str]] = None,
 ) -> Callable:
     """
-    Decorator for remote Python function execution over SSH.
-    
-    The decorated function will execute on the remote machine. Variables
-    from the enclosing scope are automatically captured and modifications
-    are synced back after execution.
-    
-    Note:
-        Cross-Python-version execution is supported! The function source code
-        is sent to the remote, so you can run Python 3.10 locally and execute
-        on a remote Python 3.12 environment.
-        
-        However, return values must be serializable across versions. For best
-        compatibility, return primitive types (dict, list, str, int, float).
-    
-    Note:
-        To reassign variables from outer scope, use `global` keyword:
-        
-            x = 10
-            
-            @remote(...)
-            def compute():
-                global x  # required for reassignment
-                x = x + 1
-        
-        Mutable objects (lists, dicts) can be modified in-place without `global`.
+    Decorator for remote Python function execution over SSH with optional
+    multi-GPU/multi-process support.
     
     Args:
         host: Remote hostname or IP
@@ -807,31 +973,61 @@ def remote(
         dependencies: List of pip packages to install on remote
         python_path: Override python interpreter path
         setup_commands: List of shell commands to run before execution
-        install_verbose: If True, stream pip/uv install output to stdout in real-time
-        stdout_callback: Optional callback function that receives each line of
-            stdout output as it streams from the remote. Useful for real-time
-            logging, progress tracking, or capturing output without printing.
+        install_verbose: If True, stream pip/uv install output
+        stdout_callback: Callback for stdout streaming
+        multiprocessing: Enable multi-GPU execution. Can be:
+            - int: Explicit number of processes/GPUs
+            - "auto": Auto-detect GPU count
+            - MultiprocessingConfig: Full configuration
+        env: Dictionary of environment variables to set on remote
     
     Examples:
-        # Cross-version execution (local 3.10, remote 3.12)
-        @remote("server.com", "user", password="pass",
-                uv=UvConfig(path="~/.venv", python_version="3.12"),
-                dependencies=["numpy"])
-        def compute():
-            import numpy as np
-            arr = np.array([1, 2, 3])
-            print(f"Running on Python {__import__('sys').version}")
-            return arr.tolist()  # return list for cross-version compatibility
-        
-        result = compute()
-        
-        # Stream installation output for large dependencies
-        @remote("server.com", "user", password="pass",
-                dependencies=["torch", "transformers"],
-                install_verbose=True)
+        # Single GPU execution (default)
+        @remote("server", "user", password="xxx", dependencies=["torch"])
         def train():
+            return "done"
+        
+        # With environment variables
+        @remote("server", "user", password="xxx",
+                dependencies=["torch"],
+                env={
+                    "CUDA_VISIBLE_DEVICES": "0,1,2,3",
+                    "NCCL_DEBUG": "INFO",
+                    "TORCH_DISTRIBUTED_DEBUG": "DETAIL",
+                    "HF_HOME": "/data/huggingface",
+                })
+        def train_with_env():
+            import os
+            print(f"CUDA_VISIBLE_DEVICES: {os.environ.get('CUDA_VISIBLE_DEVICES')}")
+            return "done"
+        
+        # Multi-GPU with auto-detection
+        @remote("server", "user", password="xxx", 
+                dependencies=["torch"],
+                multiprocessing="auto")
+        def train_ddp(config):
+            # rank and world_size are automatically injected
             import torch
-            return torch.cuda.is_available()
+            # ... training code ...
+            return {"loss": 0.1}  # only rank 0's return value is captured
+        
+        # Explicit GPU count
+        @remote("server", "user", password="xxx",
+                dependencies=["torch"],
+                multiprocessing=4)
+        def train_4gpu():
+            ...
+        
+        # Full configuration
+        @remote("server", "user", password="xxx",
+                dependencies=["torch"],
+                multiprocessing=MultiprocessingConfig(
+                    num_processes=8,
+                    backend="nccl",
+                    master_port=29501,
+                ))
+        def train_custom(data):
+            ...
     """
     ssh_config = SSHConfig(
         host=host,
@@ -852,6 +1048,8 @@ def remote(
         setup_commands=setup_commands,
         install_verbose=install_verbose,
         stdout_callback=stdout_callback,
+        multiprocessing=multiprocessing,
+        env=env,
     )
     
     def decorator(func: Callable) -> Callable:

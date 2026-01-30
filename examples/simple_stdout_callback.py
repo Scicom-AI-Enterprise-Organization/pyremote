@@ -14,7 +14,7 @@ def log_handler(line: str):
     "localhost", 
     "ubuntu", 
     password="ubuntu123",
-    uv=UvConfig(path="~/.venv", python_version="3.12"),
+    uv=UvConfig(path="~/.venv-3.12", python_version="3.12"),
     timeout=60,
     stdout_callback=log_handler,
 )
