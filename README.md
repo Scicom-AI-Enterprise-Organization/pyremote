@@ -9,9 +9,10 @@ Pythonic remote code execution using decorators. Run code on remote servers as i
 3. Multiple Python Versions, run different Python versions simultaneously using virtual environments or uv.
 4. Automatic Dependency Management, auto-install pip packages on remote servers.
 5. Variable State Synchronization, automatically sync global variables between local and remote execution.
-6. Multi-GPU Support, built-in distributed training with PyTorch using multi-processing.
+6. Multi-GPU Support, built-in distributed training with PyTorch using multiprocessing.
 7. Real-time Output Streaming, stream stdout/stderr with custom callbacks.
 8. Environment Variable Control, set remote environment variables per function.
+9. Auto Cleanup, set to delete after done.
 
 ## How to
 
@@ -89,7 +90,7 @@ def remote(
         setup_commands: List of shell commands to run before execution
         install_verbose: If True, stream pip/uv install output
         stdout_callback: Callback for stdout streaming
-        multiprocessing: Enable multi-GPU execution. Can be:
+        multiprocessing: Enable multi-GPU execution for PyTorch. Can be:
             - int: Explicit number of processes/GPUs
             - "auto": Auto-detect GPU count
             - MultiprocessingConfig: Full configuration
@@ -142,6 +143,14 @@ def remote(
                 ))
         def train_custom(data):
             ...
+        
+        # With delete_after_done to clean up venv after execution
+        @remote("server", "user", password="xxx",
+                uv=UvConfig(path="~/.temp-venv", delete_after_done=True),
+                dependencies=["numpy"])
+        def one_time_job():
+            import numpy as np
+            return np.array([1, 2, 3])
     """
 ```
 
@@ -365,7 +374,7 @@ from pyremote import remote, UvConfig
     "localhost", 
     "ubuntu", 
     password="ubuntu123", 
-    uv=UvConfig(path="~/.venv-3.12-v2", python_version="3.12", install_uv=True), 
+    uv=UvConfig(path="~/.venv-3.12-v2", python_version="3.12", install_uv=True, delete_after_done=True), 
     dependencies=[
         "numpy==1.26.4", 
         "torch==2.9.1", 
@@ -448,7 +457,7 @@ def compute():
         per_device_train_batch_size=8,
         per_device_eval_batch_size=8,
         logging_steps=8,
-        num_train_epochs=1,
+        max_steps=10,
     )
 
     trainer = Trainer(
@@ -541,13 +550,153 @@ husein-MS-7D31:1463326:1463523 [0] NCCL INFO Connected all rings, use ring PXN 0
 husein-MS-7D31:1463327:1463522 [1] NCCL INFO Connected all rings, use ring PXN 0 GDR 1
   0%|                                                   | 0/279 [00:00<?, ?it/s][rank0]:[W130 13:08:42.490301705 reducer.cpp:1431] Warning: find_unused_parameters=True was specified in DDP constructor, but did not find any unused parameters in the forward pass. This flag results in an extra traversal of the autograd graph every iteration,  which can adversely affect performance. If your model indeed never has any unused parameters in the forward pass, consider turning this flag off. Note that this warning may be a false positive if your model has flow control causing later iterations to have unused parameters. (function operator())
 [rank1]:[W130 13:08:42.490301711 reducer.cpp:1431] Warning: find_unused_parameters=True was specified in DDP constructor, but did not find any unused parameters in the forward pass. This flag results in an extra traversal of the autograd graph every iteration,  which can adversely affect performance. If your model indeed never has any unused parameters in the forward pass, consider turning this flag off. Note that this warning may be a false positive if your model has flow control causing later iterations to have unused parameters. (function operator())
-{'loss': 0.4127, 'grad_norm': 1.3765112161636353, 'learning_rate': 4.874551971326165e-05, 'epoch': 0.03}
-{'loss': 0.1833, 'grad_norm': 1.3945658206939697, 'learning_rate': 4.731182795698925e-05, 'epoch': 0.06}
-{'loss': 0.122, 'grad_norm': 0.32930460572242737, 'learning_rate': 4.5878136200716846e-05, 'epoch': 0.09}
-{'loss': 0.016, 'grad_norm': 0.09802871942520142, 'learning_rate': 4.4444444444444447e-05, 'epoch': 0.11}
-{'loss': 0.0351, 'grad_norm': 0.06295208632946014, 'learning_rate': 4.301075268817205e-05, 'epoch': 0.14}
-{'loss': 0.0362, 'grad_norm': 3.014906644821167, 'learning_rate': 4.157706093189964e-05, 'epoch': 0.17}
+{'train_runtime': 4.8779, 'train_samples_per_second': 32.801, 'train_steps_per_second': 2.05, 'train_loss': 0.5222671627998352, 'epoch': 0.04}
+100%|███████████████████████████████████████████| 10/10 [00:04<00:00,  2.10it/s]
+husein-MS-7D31:176395:176395 [1] NCCL INFO comm 0x3bcb2f40 rank 1 nranks 2 cudaDev 1 busId 8000 - Destroy COMPLETE
+husein-MS-7D31:176394:176394 [0] NCCL INFO comm 0x10233d80 rank 0 nranks 2 cudaDev 0 busId 1000 - Destroy COMPLETE
+Deleted virtual environment at /home/ubuntu/.venv-3.12-v2
 ```
 
-
 Checkout [examples/simple_ddp.py](examples/simple_ddp.py)
+
+### Multi one time jobs
+
+```python
+from multiprocess import Pool
+from pyremote import remote, UvConfig
+
+def run_version(v):
+    @remote(
+        "localhost",
+        "ubuntu",
+        password="ubuntu123",
+        uv=UvConfig(
+            path=f"~/.venv-{v}",
+            python_version=v,
+            install_uv=True,
+            delete_after_done=True
+        ),
+        dependencies=["numpy==1.26.4", "pandas==2.2.3"],
+        install_verbose=True,
+    )
+    def compute():
+        import numpy as np
+        import pandas as pd
+        import sys
+
+        print("inside compute()", sys.version)
+        return pd.DataFrame(
+            {"name": ["a", "b", "c"], "data": np.array([1, 2, 3])}
+        )
+
+    return compute()
+
+def main():
+    versions = ["3.9", "3.10", "3.11", "3.12", "3.13"]
+
+    with Pool(len(versions)) as pool:
+        results = pool.map(run_version, versions)
+
+    print(results)
+
+if __name__ == "__main__":
+    main()
+```
+
+Output,
+
+```
+Using CPython 3.11.13 interpreter at: /usr/bin/python3.11
+Creating virtual environment at: .venv-3.11
+Activate with: source .venv-3.11/bin/activate
+Using CPython 3.9.16 interpreter at: /usr/bin/python3.9
+Creating virtual environment at: .venv-3.9
+Activate with: source .venv-3.9/bin/activate
+Using CPython 3.13.11
+Creating virtual environment at: .venv-3.13
+Activate with: source .venv-3.13/bin/activate
+Using CPython 3.12.12
+Creating virtual environment at: .venv-3.12
+Activate with: source .venv-3.12/bin/activate
+Using CPython 3.10.17 interpreter at: /usr/bin/python3.10
+Creating virtual environment at: .venv-3.10
+Activate with: source .venv-3.10/bin/activate
+Using Python 3.9.16 environment at: .venv-3.9
+Using Python 3.11.13 environment at: .venv-3.11
+Using Python 3.13.11 environment at: .venv-3.13
+Using Python 3.12.12 environment at: .venv-3.12
+Using Python 3.10.17 environment at: .venv-3.10
+Resolved 1 package in 47ms
+Installed 1 package in 1ms
+ + cloudpickle==3.1.2
+Resolved 1 package in 57ms
+Installed 1 package in 1ms
+ + cloudpickle==3.1.2
+Resolved 1 package in 55ms
+Installed 1 package in 1ms
+ + cloudpickle==3.1.2
+Resolved 1 package in 68ms
+Installed 1 package in 1ms
+ + cloudpickle==3.1.2
+Resolved 1 package in 76ms
+Installed 1 package in 1ms
+ + cloudpickle==3.1.2
+Using Python 3.9.16 environment at: .venv-3.9
+Resolved 6 packages in 4ms
+Using Python 3.12.12 environment at: .venv-3.12
+Using Python 3.13.11 environment at: .venv-3.13
+Installed 6 packages in 9ms
+ + numpy==1.26.4
+ + pandas==2.2.3
+ + python-dateutil==2.9.0.post0
+ + pytz==2025.2
+ + six==1.17.0
+ + tzdata==2025.3
+Resolved 6 packages in 4ms
+Resolved 6 packages in 4ms
+Installed 6 packages in 9ms
+ + numpy==1.26.4
+ + pandas==2.2.3
+ + python-dateutil==2.9.0.post0
+ + pytz==2025.2
+ + six==1.17.0
+ + tzdata==2025.3
+Using Python 3.10.17 environment at: .venv-3.10
+Using Python 3.11.13 environment at: .venv-3.11
+Installed 6 packages in 10ms
+ + numpy==1.26.4
+ + pandas==2.2.3
+ + python-dateutil==2.9.0.post0
+ + pytz==2025.2
+ + six==1.17.0
+ + tzdata==2025.3
+Resolved 6 packages in 4ms
+Resolved 6 packages in 4ms
+Installed 6 packages in 9ms
+ + numpy==1.26.4
+ + pandas==2.2.3
+ + python-dateutil==2.9.0.post0
+ + pytz==2025.2
+ + six==1.17.0
+ + tzdata==2025.3
+Installed 6 packages in 13ms
+ + numpy==1.26.4
+ + pandas==2.2.3
+ + python-dateutil==2.9.0.post0
+ + pytz==2025.2
+ + six==1.17.0
+ + tzdata==2025.3
+inside compute() 3.10.17 (main, Apr  9 2025, 08:54:15) [GCC 9.4.0]
+inside compute() 3.9.16 (main, Dec  7 2022, 01:11:51) 
+[GCC 9.4.0]
+inside compute() 3.11.13 (main, Jun  4 2025, 08:57:30) [GCC 9.4.0]
+inside compute() 3.13.11 (main, Jan 14 2026, 19:38:04) [Clang 21.1.4 ]
+inside compute() 3.12.12 (main, Dec  9 2025, 19:02:36) [Clang 21.1.4 ]
+Deleted virtual environment at /home/ubuntu/.venv-3.9
+Deleted virtual environment at /home/ubuntu/.venv-3.11
+Deleted virtual environment at /home/ubuntu/.venv-3.10
+Deleted virtual environment at /home/ubuntu/.venv-3.12
+Deleted virtual environment at /home/ubuntu/.venv-3.13
+```
+
+Checkout [examples/simple_onetime_mp.py](examples/simple_onetime_mp.py)

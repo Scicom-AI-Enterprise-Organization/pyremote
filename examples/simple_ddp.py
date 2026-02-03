@@ -4,7 +4,7 @@ from pyremote import remote, UvConfig
     "localhost", 
     "ubuntu", 
     password="ubuntu123", 
-    uv=UvConfig(path="~/.venv-3.12-v2", python_version="3.12", install_uv=True), 
+    uv=UvConfig(path="~/.venv-3.12-v2", python_version="3.12", install_uv=True, delete_after_done=True), 
     dependencies=[
         "numpy==1.26.4", 
         "torch==2.9.1", 
@@ -27,6 +27,7 @@ def compute():
     import torch
     import torch.distributed as dist
     import evaluate
+    import numpy as np
     from datasets import load_dataset
     from transformers import (
         AutoModelForSequenceClassification,
@@ -87,7 +88,7 @@ def compute():
         per_device_train_batch_size=8,
         per_device_eval_batch_size=8,
         logging_steps=8,
-        num_train_epochs=1,
+        max_steps=10,
     )
 
     trainer = Trainer(
