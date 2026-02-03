@@ -52,6 +52,7 @@ class VenvConfig:
     path: str
     create_if_missing: bool = True
     python_base: str = "python3"
+    delete_after_done: bool = False
     
     @property
     def python_path(self) -> str:
@@ -73,6 +74,7 @@ class UvConfig:
     python_version: Optional[str] = None
     create_if_missing: bool = True
     install_uv: bool = True
+    delete_after_done: bool = False
     
     @property
     def python_path(self) -> str:
@@ -178,6 +180,8 @@ class RemoteExecutor:
         self._deps_installed: Set[str] = set()
         self._venv_verified: bool = False
         self._uv_verified: bool = False
+        self._expanded_venv_path: Optional[str] = None  # Track expanded path for cleanup
+        self._expanded_uv_path: Optional[str] = None  # Track expanded path for cleanup
     
     def _connect(self):
         try:
@@ -283,11 +287,13 @@ class RemoteExecutor:
         exit_status, expanded_path, _ = self._run_command(f'echo {uv_path}')
         if exit_status == 0:
             uv_path = expanded_path.strip()
+            self._expanded_uv_path = uv_path  # Store expanded path for cleanup
             self.uv = UvConfig(
                 path=uv_path,
                 python_version=self.uv.python_version,
                 create_if_missing=self.uv.create_if_missing,
                 install_uv=self.uv.install_uv,
+                delete_after_done=self.uv.delete_after_done,
             )
             self._python_path = self.uv.python_path
         
@@ -358,10 +364,12 @@ class RemoteExecutor:
         exit_status, expanded_path, _ = self._run_command(f'echo {venv_path}')
         if exit_status == 0:
             venv_path = expanded_path.strip()
+            self._expanded_venv_path = venv_path  # Store expanded path for cleanup
             self.venv = VenvConfig(
                 path=venv_path,
                 create_if_missing=self.venv.create_if_missing,
                 python_base=self.venv.python_base,
+                delete_after_done=self.venv.delete_after_done,
             )
             self._python_path = self.venv.python_path
         
@@ -395,6 +403,26 @@ class RemoteExecutor:
                 )
         
         self._venv_verified = True
+    
+    def _cleanup_venv(self):
+        """Delete the virtual environment if delete_after_done is True."""
+        path_to_delete = None
+        
+        if self.uv and self.uv.delete_after_done:
+            path_to_delete = self._expanded_uv_path or self.uv.path
+        elif self.venv and self.venv.delete_after_done:
+            path_to_delete = self._expanded_venv_path or self.venv.path
+        
+        if path_to_delete:
+            # Safety check: ensure path is not empty or root-like
+            if path_to_delete and path_to_delete not in ('/', '/home', '/root', '~'):
+                delete_cmd = f'rm -rf {path_to_delete}'
+                exit_status, stdout, stderr = self._run_command(delete_cmd, timeout=60, stream=self.install_verbose)
+                if exit_status != 0:
+                    print(f"Warning: Failed to delete virtual environment at {path_to_delete}: {stderr}", 
+                          file=sys.stderr)
+                elif self.install_verbose:
+                    print(f"Deleted virtual environment at {path_to_delete}")
     
     def _install_dependencies(self):
         if not self.dependencies:
@@ -935,6 +963,9 @@ if __name__ == "__main__":
             return result.return_value
             
         finally:
+            # Cleanup virtual environment if delete_after_done is True
+            if self._client:
+                self._cleanup_venv()
             self._disconnect()
 
 
@@ -975,7 +1006,7 @@ def remote(
         setup_commands: List of shell commands to run before execution
         install_verbose: If True, stream pip/uv install output
         stdout_callback: Callback for stdout streaming
-        multiprocessing: Enable multi-GPU execution. Can be:
+        multiprocessing: Enable multi-GPU execution for PyTorch. Can be:
             - int: Explicit number of processes/GPUs
             - "auto": Auto-detect GPU count
             - MultiprocessingConfig: Full configuration
@@ -1028,6 +1059,14 @@ def remote(
                 ))
         def train_custom(data):
             ...
+        
+        # With delete_after_done to clean up venv after execution
+        @remote("server", "user", password="xxx",
+                uv=UvConfig(path="~/.temp-venv", delete_after_done=True),
+                dependencies=["numpy"])
+        def one_time_job():
+            import numpy as np
+            return np.array([1, 2, 3])
     """
     ssh_config = SSHConfig(
         host=host,
