@@ -12,7 +12,8 @@ Pythonic remote code execution using decorators. Run code on remote servers as i
 6. Multi-GPU Support, built-in distributed training with PyTorch using multiprocessing.
 7. Real-time Output Streaming, stream stdout/stderr with custom callbacks.
 8. Environment Variable Control, set remote environment variables per function.
-9. Auto Cleanup, set to delete after done.
+9. Also support for Jupyter Notebook, able to multi-remote.
+10. Auto Cleanup, set to delete after done.
 
 ## How to
 
@@ -54,8 +55,8 @@ Computed: 20
 
 ```python
 def remote(
-    host: str,
-    username: str,
+    host: str = None,
+    username: str = None,
     port: int = 22,
     password: Optional[str] = None,
     key_filename: Optional[str] = None,
@@ -70,11 +71,15 @@ def remote(
     stdout_callback: Optional[Callable[[str], None]] = None,
     multiprocessing: Optional[Union[int, Literal["auto"], MultiprocessingConfig]] = None,
     env: Optional[Dict[str, str]] = None,
+    jupyter_mode: bool = False,
+    jupyter_profile: str = 'default',
+    _return_executor: bool = False,
 ) -> Callable:
     """
     Decorator for remote Python function execution over SSH with optional
-    multi-GPU/multi-process support.
-    
+    multi-GPU/multi-process support. Can also be used to configure global
+    executor for Jupyter notebook cell magic.
+
     Args:
         host: Remote hostname or IP
         username: SSH username
@@ -95,13 +100,19 @@ def remote(
             - "auto": Auto-detect GPU count
             - MultiprocessingConfig: Full configuration
         env: Dictionary of environment variables to set on remote
-    
+        jupyter_mode: If True, automatically register %%remotecell magic and
+            set up the remote environment immediately (connect, install dependencies).
+            This makes the first cell execution faster.
+        jupyter_profile: Profile name for Jupyter mode (default: 'default').
+            Allows multiple remote connections. Use %%remotecell --profile <name>
+            to execute on a specific profile.
+
     Examples:
-        # Single GPU execution (default)
+        # As decorator - Single GPU execution (default)
         @remote("server", "user", password="xxx", dependencies=["torch"])
         def train():
             return "done"
-        
+
         # With environment variables
         @remote("server", "user", password="xxx",
                 dependencies=["torch"],
@@ -115,9 +126,9 @@ def remote(
             import os
             print(f"CUDA_VISIBLE_DEVICES: {os.environ.get('CUDA_VISIBLE_DEVICES')}")
             return "done"
-        
+
         # Multi-GPU with auto-detection
-        @remote("server", "user", password="xxx", 
+        @remote("server", "user", password="xxx",
                 dependencies=["torch"],
                 multiprocessing="auto")
         def train_ddp(config):
@@ -125,14 +136,14 @@ def remote(
             import torch
             # ... training code ...
             return {"loss": 0.1}  # only rank 0's return value is captured
-        
+
         # Explicit GPU count
         @remote("server", "user", password="xxx",
                 dependencies=["torch"],
                 multiprocessing=4)
         def train_4gpu():
             ...
-        
+
         # Full configuration
         @remote("server", "user", password="xxx",
                 dependencies=["torch"],
@@ -143,7 +154,7 @@ def remote(
                 ))
         def train_custom(data):
             ...
-        
+
         # With delete_after_done to clean up venv after execution
         @remote("server", "user", password="xxx",
                 uv=UvConfig(path="~/.temp-venv", delete_after_done=True),
@@ -151,6 +162,50 @@ def remote(
         def one_time_job():
             import numpy as np
             return np.array([1, 2, 3])
+
+        # In Jupyter notebooks - configure global executor (manual registration)
+        from pyremote import remote, remotecell
+
+        remote(
+            host="server",
+            username="user",
+            password="xxx",
+            dependencies=["torch", "numpy"]
+        )
+        remotecell()  # Register the magic
+
+        # Or use jupyter_mode for automatic setup
+        from pyremote import remote
+
+        remote(
+            host="server",
+            username="user",
+            password="xxx",
+            uv=UvConfig(path="~/.venv-3.10", python_version="3.10"),
+            dependencies=["torch", "numpy"],
+            install_verbose=True,
+            jupyter_mode=True  # Automatically register magic and setup environment
+        )
+
+        # Then use cell magic
+        %%remotecell
+        import torch
+        print(f"PyTorch version: {torch.__version__}")
+        result = torch.tensor([1, 2, 3])
+        result  # This will be returned
+
+        # Multiple profiles example
+        remote("server1", "user", password="xxx", jupyter_mode=True, jupyter_profile="gpu1")
+        remote("server2", "user", password="xxx", jupyter_mode=True, jupyter_profile="gpu2")
+
+        %%remotecell --profile gpu1
+        # Runs on server1
+
+        %%remotecell --profile gpu2
+        # Runs on server2
+
+        %%remotecell
+        # Runs on first registered profile (gpu1)
     """
 ```
 
@@ -700,3 +755,233 @@ Deleted virtual environment at /home/ubuntu/.venv-3.13
 ```
 
 Checkout [examples/simple_onetime_mp.py](examples/simple_onetime_mp.py)
+
+### Jupyter Notebook
+
+```python
+from pyremote import remote, remotecell, UvConfig, close_remote
+import numpy as np
+```
+
+```python
+remote(
+    "localhost", 
+    "ubuntu", 
+    password="ubuntu123", 
+    uv=UvConfig(path="~/.venv-3.11", python_version="3.11", install_uv=True, delete_after_done=True), 
+    dependencies=["numpy==1.26.4", "pandas==2.2.3", "torch==2.9.1"],
+    install_verbose=True,
+    jupyter_mode=True,
+)
+```
+
+```
+    Using CPython 3.11.13 interpreter at: /usr/bin/python3.11
+    Creating virtual environment at: .venv-3.11
+    Activate with: source .venv-3.11/bin/activate
+    Using Python 3.11.13 environment at: .venv-3.11
+    Resolved 1 package in 0.96ms
+    Installed 1 package in 2ms
+     + cloudpickle==3.1.2
+    Using Python 3.11.13 environment at: .venv-3.11
+    Resolved 31 packages in 8ms
+    Installed 31 packages in 90ms
+     + filelock==3.20.3
+     + fsspec==2026.1.0
+     + jinja2==3.1.6
+     + markupsafe==3.0.3
+     + mpmath==1.3.0
+     + networkx==3.6.1
+     + numpy==1.26.4
+     + nvidia-cublas-cu12==12.8.4.1
+     + nvidia-cuda-cupti-cu12==12.8.90
+     + nvidia-cuda-nvrtc-cu12==12.8.93
+     + nvidia-cuda-runtime-cu12==12.8.90
+     + nvidia-cudnn-cu12==9.10.2.21
+     + nvidia-cufft-cu12==11.3.3.83
+     + nvidia-cufile-cu12==1.13.1.3
+     + nvidia-curand-cu12==10.3.9.90
+     + nvidia-cusolver-cu12==11.7.3.90
+     + nvidia-cusparse-cu12==12.5.8.93
+     + nvidia-cusparselt-cu12==0.7.1
+     + nvidia-nccl-cu12==2.27.5
+     + nvidia-nvjitlink-cu12==12.8.93
+     + nvidia-nvshmem-cu12==3.3.20
+     + nvidia-nvtx-cu12==12.8.90
+     + pandas==2.2.3
+     + python-dateutil==2.9.0.post0
+     + pytz==2025.2
+     + six==1.17.0
+     + sympy==1.14.0
+     + torch==2.9.1
+     + triton==3.5.1
+     + typing-extensions==4.15.0
+     + tzdata==2025.3
+```
+
+```python
+remote(
+    "localhost", 
+    "ubuntu", 
+    password="ubuntu123", 
+    uv=UvConfig(path="~/.venv-3.10", python_version="3.10", install_uv=True, delete_after_done=True), 
+    dependencies=["numpy==1.26.4", "pandas==2.2.3", "torch==2.9.1"],
+    install_verbose=True,
+    jupyter_mode=True,
+    jupyter_profile="3.10"
+)
+```
+
+```
+    Using CPython 3.10.17 interpreter at: /usr/bin/python3.10
+    Creating virtual environment at: .venv-3.10
+    Activate with: source .venv-3.10/bin/activate
+    Using Python 3.10.17 environment at: .venv-3.10
+    Resolved 1 package in 1ms
+    Installed 1 package in 1ms
+     + cloudpickle==3.1.2
+    Using Python 3.10.17 environment at: .venv-3.10
+    Resolved 31 packages in 7ms
+    Installed 31 packages in 71ms
+     + filelock==3.20.3
+     + fsspec==2026.1.0
+     + jinja2==3.1.6
+     + markupsafe==3.0.3
+     + mpmath==1.3.0
+     + networkx==3.4.2
+     + numpy==1.26.4
+     + nvidia-cublas-cu12==12.8.4.1
+     + nvidia-cuda-cupti-cu12==12.8.90
+     + nvidia-cuda-nvrtc-cu12==12.8.93
+     + nvidia-cuda-runtime-cu12==12.8.90
+     + nvidia-cudnn-cu12==9.10.2.21
+     + nvidia-cufft-cu12==11.3.3.83
+     + nvidia-cufile-cu12==1.13.1.3
+     + nvidia-curand-cu12==10.3.9.90
+     + nvidia-cusolver-cu12==11.7.3.90
+     + nvidia-cusparse-cu12==12.5.8.93
+     + nvidia-cusparselt-cu12==0.7.1
+     + nvidia-nccl-cu12==2.27.5
+     + nvidia-nvjitlink-cu12==12.8.93
+     + nvidia-nvshmem-cu12==3.3.20
+     + nvidia-nvtx-cu12==12.8.90
+     + pandas==2.2.3
+     + python-dateutil==2.9.0.post0
+     + pytz==2025.2
+     + six==1.17.0
+     + sympy==1.14.0
+     + torch==2.9.1
+     + triton==3.5.1
+     + typing-extensions==4.15.0
+     + tzdata==2025.3
+```
+
+```python
+x = 10
+result = np.array([1, 2, 3])
+```
+
+```python
+%%remotecell
+import numpy as np
+import torch
+import sys
+
+print(sys.version)
+
+y = np.array([1, 2, 3])
+print(f"Defined x={x}, result={result}")
+
+t = torch.randn(10, 10).cuda()
+print(t)
+```
+
+```
+    3.11.13 (main, Jun  4 2025, 08:57:30) [GCC 9.4.0]
+    Defined x=10, result=[1 2 3]
+    tensor([[ 6.1146e-01,  2.2552e-01, -7.4423e-01,  2.1329e-01,  1.7878e+00,
+              1.6502e+00,  6.1555e-01,  9.6762e-01, -9.2587e-02,  8.1585e-01],
+            [ 1.4931e+00, -6.8062e-01, -8.9354e-01,  5.4590e-01,  1.9131e-03,
+              2.3486e-02, -1.8477e-01,  4.7742e-02, -6.4516e-01, -1.1166e-01],
+            [ 5.0783e-01,  9.5421e-02,  1.0320e+00,  1.0705e+00, -2.7514e-01,
+             -2.7833e-01, -1.8243e-01, -2.2620e-01,  1.8950e+00, -4.2753e-01],
+            [ 1.2461e+00, -1.3281e+00, -2.1273e+00,  1.2477e+00,  5.9034e-01,
+             -9.1703e-01,  3.9618e-01,  2.7257e-01,  3.9846e-01, -2.2619e+00],
+            [ 1.8078e+00,  1.0062e+00, -8.1295e-02, -4.7849e-01,  2.8566e-02,
+              1.9351e-01,  1.9739e+00,  9.0229e-03,  2.6468e-01,  7.7196e-01],
+            [-3.6440e-01, -1.3292e+00,  5.7839e-01, -5.5599e-01, -6.3926e-01,
+              1.2966e+00, -7.8355e-01,  4.3229e-01, -6.4102e-01, -8.6305e-02],
+            [-8.2536e-01, -1.0366e+00, -3.6685e-01, -1.0335e+00,  6.1879e-01,
+             -1.2390e+00, -6.1706e-01, -1.2072e+00,  2.4161e+00, -9.8014e-01],
+            [-1.3233e+00, -1.4276e+00, -1.8212e+00, -9.6309e-01,  7.0925e-01,
+              2.8101e-01, -3.8862e-01, -4.3115e-01,  3.3140e-01, -9.2514e-02],
+            [-6.6766e-01,  2.3285e-01,  4.4315e-01, -1.7091e-01,  7.4387e-01,
+             -3.2802e-01, -1.1730e+00, -6.1005e-01,  9.1896e-01, -1.6952e+00],
+            [ 4.0766e-02, -9.2963e-01, -7.0721e-01, -9.4238e-01, -5.6975e-01,
+              8.7586e-01, -1.0832e+00,  5.1352e-01,  1.2193e+00,  5.9838e-01]],
+           device='cuda:0')
+```
+
+```python
+%%remotecell --profile 3.10
+
+import numpy as np
+import torch
+import sys
+
+print(sys.version)
+print(t)
+```
+
+```
+    3.10.17 (main, Apr  9 2025, 08:54:15) [GCC 9.4.0]
+    tensor([[ 6.1146e-01,  2.2552e-01, -7.4423e-01,  2.1329e-01,  1.7878e+00,
+              1.6502e+00,  6.1555e-01,  9.6762e-01, -9.2587e-02,  8.1585e-01],
+            [ 1.4931e+00, -6.8062e-01, -8.9354e-01,  5.4590e-01,  1.9131e-03,
+              2.3486e-02, -1.8477e-01,  4.7742e-02, -6.4516e-01, -1.1166e-01],
+            [ 5.0783e-01,  9.5421e-02,  1.0320e+00,  1.0705e+00, -2.7514e-01,
+             -2.7833e-01, -1.8243e-01, -2.2620e-01,  1.8950e+00, -4.2753e-01],
+            [ 1.2461e+00, -1.3281e+00, -2.1273e+00,  1.2477e+00,  5.9034e-01,
+             -9.1703e-01,  3.9618e-01,  2.7257e-01,  3.9846e-01, -2.2619e+00],
+            [ 1.8078e+00,  1.0062e+00, -8.1295e-02, -4.7849e-01,  2.8566e-02,
+              1.9351e-01,  1.9739e+00,  9.0229e-03,  2.6468e-01,  7.7196e-01],
+            [-3.6440e-01, -1.3292e+00,  5.7839e-01, -5.5599e-01, -6.3926e-01,
+              1.2966e+00, -7.8355e-01,  4.3229e-01, -6.4102e-01, -8.6305e-02],
+            [-8.2536e-01, -1.0366e+00, -3.6685e-01, -1.0335e+00,  6.1879e-01,
+             -1.2390e+00, -6.1706e-01, -1.2072e+00,  2.4161e+00, -9.8014e-01],
+            [-1.3233e+00, -1.4276e+00, -1.8212e+00, -9.6309e-01,  7.0925e-01,
+              2.8101e-01, -3.8862e-01, -4.3115e-01,  3.3140e-01, -9.2514e-02],
+            [-6.6766e-01,  2.3285e-01,  4.4315e-01, -1.7091e-01,  7.4387e-01,
+             -3.2802e-01, -1.1730e+00, -6.1005e-01,  9.1896e-01, -1.6952e+00],
+            [ 4.0766e-02, -9.2963e-01, -7.0721e-01, -9.4238e-01, -5.6975e-01,
+              8.7586e-01, -1.0832e+00,  5.1352e-01,  1.2193e+00,  5.9838e-01]],
+           device='cuda:0')
+```
+
+```python
+%%remotecell
+
+import numpy as np
+
+global result
+
+result = np.concatenate([result, result])
+print(result)
+```
+
+```
+    [1 2 3 1 2 3]
+```
+
+```python
+close_remote()
+```
+
+```
+    Deleted virtual environment at /home/ubuntu/.venv-3.11
+    Remote connection closed.
+    Deleted virtual environment at /home/ubuntu/.venv-3.10
+    Remote connection closed.
+```
+
+Checkout [examples/simple_notebook.ipynb](examples/simple_notebook.ipynb)
