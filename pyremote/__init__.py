@@ -900,10 +900,8 @@ def main():
                 locals_dict, actual_result = func_result
                 if isinstance(locals_dict, dict):
                     # This is from remotecell - merge locals into modified_vars
-                    import types
+                    # Include modules so imports persist across cells
                     for var, val in locals_dict.items():
-                        if isinstance(val, types.ModuleType):
-                            continue
                         try:
                             cloudpickle.dumps(val)
                             result['modified_vars'][var] = val

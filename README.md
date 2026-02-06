@@ -925,10 +925,6 @@ print(t)
 ```python
 %%remotecell --profile 3.10
 
-import numpy as np
-import torch
-import sys
-
 print(sys.version)
 print(t)
 ```
@@ -960,8 +956,6 @@ print(t)
 
 ```python
 %%remotecell
-
-import numpy as np
 
 global result
 
