@@ -190,6 +190,7 @@ class RemoteExecutor:
         self._uv_verified: bool = False
         self._expanded_venv_path: Optional[str] = None  # Track expanded path for cleanup
         self._expanded_uv_path: Optional[str] = None  # Track expanded path for cleanup
+        self._persistent_shell = None  # paramiko Channel for persistent Python REPL
     
     def _connect(self):
         try:
@@ -220,6 +221,12 @@ class RemoteExecutor:
             raise RemoteConnectionError(f"Connection failed: {e}") from e
     
     def _disconnect(self):
+        if self._persistent_shell:
+            try:
+                self._persistent_shell.close()
+            except Exception:
+                pass
+            self._persistent_shell = None
         if self._client:
             self._client.close()
             self._client = None
@@ -940,6 +947,214 @@ if __name__ == "__main__":
     main()
 '''
     
+    def _start_persistent_session(self):
+        """Start a persistent Python REPL on the remote via invoke_shell().
+
+        This creates an interactive shell, activates the venv, and starts
+        a Python session with a namespace dict for variable persistence.
+        """
+        import time as _time
+
+        shell = self._client.invoke_shell(term='dumb')
+        shell.settimeout(self.ssh_config.timeout * 10)
+
+        # Wait for shell to be ready
+        _time.sleep(0.5)
+        while shell.recv_ready():
+            shell.recv(4096)
+
+        # Activate venv if configured
+        if self.uv:
+            activate_cmd = f'source $HOME/.local/bin/env 2>/dev/null || true && source {self.uv.activate_path}'
+            python_cmd = 'python3'
+        elif self.venv:
+            activate_cmd = f'source {self.venv.activate_path}'
+            python_cmd = 'python3'
+        else:
+            activate_cmd = ''
+            python_cmd = self._python_path
+
+        if activate_cmd:
+            shell.sendall(f'{activate_cmd}\n'.encode())
+            _time.sleep(0.5)
+            while shell.recv_ready():
+                shell.recv(4096)
+
+        # Set environment variables
+        for key, value in self.env.items():
+            shell.sendall(f'export {key}="{value}"\n'.encode())
+        if self.env:
+            _time.sleep(0.3)
+            while shell.recv_ready():
+                shell.recv(4096)
+
+        # Start Python REPL with -u for unbuffered output
+        shell.sendall(f'{python_cmd} -u -i\n'.encode())
+        _time.sleep(1.0)
+        while shell.recv_ready():
+            shell.recv(4096)
+
+        # Initialize the persistent namespace and imports
+        init_code = (
+            'import base64, sys\n'
+            '__remote_namespace__ = {"__builtins__": __builtins__}\n'
+            'print("__PYREMOTE_READY__")\n'
+        )
+        shell.sendall(init_code.encode())
+
+        # Wait for ready marker
+        buffer = ''
+        start = _time.time()
+        while _time.time() - start < self.ssh_config.timeout:
+            if shell.recv_ready():
+                chunk = shell.recv(4096).decode('utf-8', errors='replace')
+                buffer += chunk
+                if '__PYREMOTE_READY__' in buffer:
+                    break
+            else:
+                _time.sleep(0.05)
+        else:
+            raise RemoteConnectionError(
+                f"Persistent session failed to start. Output:\n{buffer}"
+            )
+
+        self._persistent_shell = shell
+
+    def _execute_in_persistent_session(self, cell_code: str) -> Any:
+        """Execute cell code in the persistent Python REPL session.
+
+        Variables persist in __remote_namespace__ across calls.
+        Returns the display value (last expression) or None.
+        """
+        import time as _time
+        import uuid
+
+        shell = self._persistent_shell
+        marker = f'__PYREMOTE_EXEC_END_{uuid.uuid4().hex[:12]}__'
+
+        # Wrap code in try/except with marker, handle last expression for display
+        lines = cell_code.strip().split('\n')
+        last_line = lines[-1].strip() if lines else ''
+
+        is_expression = (
+            last_line and
+            not last_line.startswith(('def ', 'class ', 'import ', 'from ',
+                                     'if ', 'for ', 'while ', 'with ',
+                                     'try:', 'except', 'finally:', '@',
+                                     'print(', 'print (')) and
+            not last_line.endswith(':') and
+            '=' not in last_line.split('#')[0]
+        )
+
+        if is_expression:
+            # Replace last line with assignment + print
+            exec_code = '\n'.join(lines[:-1] + [
+                f'__result_val__ = {last_line}',
+                'if __result_val__ is not None: print(repr(__result_val__))',
+            ])
+        else:
+            exec_code = cell_code
+
+        # Wrap in try/except
+        wrapped = (
+            'try:\n'
+            + '\n'.join('    ' + l for l in exec_code.split('\n'))
+            + '\nexcept Exception:\n'
+            '    import traceback\n'
+            '    traceback.print_exc()\n'
+            f'print("{marker}")\n'
+        )
+
+        # Base64 encode to avoid escaping issues
+        code_encoded = base64.b64encode(wrapped.encode()).decode()
+        cmd = (
+            f"__user_code__ = base64.b64decode('{code_encoded}').decode()\n"
+            f"exec(__user_code__, __remote_namespace__)\n"
+        )
+
+        # Noise patterns to filter: echoed commands, REPL prompts, our internals
+        _noise_fragments = (
+            '__user_code__', 'exec(__user_code__', 'base64.b64decode(',
+            '__remote_namespace__', "').decode()",
+        )
+
+        def _is_noise(s):
+            """Check if a line is shell echo noise rather than user output."""
+            s = s.strip()
+            if not s:
+                return True
+            # Pure REPL prompts
+            if s in ('>>>', '...'):
+                return True
+            # Strip leading prompt and check remainder
+            for prefix in ('>>> ', '... '):
+                if s.startswith(prefix):
+                    s = s[len(prefix):]
+                    break
+            if not s.strip():
+                return True
+            for frag in _noise_fragments:
+                if frag in s:
+                    return True
+            return False
+
+        # Clear any pending output
+        while shell.recv_ready():
+            shell.recv(4096)
+
+        shell.sendall(cmd.encode())
+
+        # Read output until marker
+        buffer = ''
+        output_lines = []
+        start = _time.time()
+        timeout = self.ssh_config.timeout * 10
+
+        while _time.time() - start < timeout:
+            if shell.recv_ready():
+                chunk = shell.recv(4096).decode('utf-8', errors='replace')
+                buffer += chunk
+
+                while '\n' in buffer:
+                    line, buffer = buffer.split('\n', 1)
+
+                    if marker in line:
+                        self._persistent_shell = shell
+                        return None
+
+                    if _is_noise(line):
+                        continue
+
+                    # Strip leading REPL prompt if present
+                    display = line
+                    for prefix in ('>>> ', '... '):
+                        if display.lstrip().startswith(prefix):
+                            display = display.lstrip()[len(prefix):]
+                            break
+
+                    output_lines.append(display)
+                    print(display, flush=True)
+                    if self.stdout_callback:
+                        self.stdout_callback(display)
+
+                # Check if marker is in buffer (no trailing newline)
+                if marker in buffer:
+                    pre_marker = buffer.split(marker)[0]
+                    for pline in pre_marker.split('\n'):
+                        if not _is_noise(pline) and pline.strip():
+                            print(pline.strip(), flush=True)
+                            if self.stdout_callback:
+                                self.stdout_callback(pline.strip())
+                    self._persistent_shell = shell
+                    return None
+            else:
+                _time.sleep(0.05)
+
+        raise RemoteExecutionError(
+            f"Persistent session execution timed out after {timeout}s.\n"
+            f"Partial output:\n" + '\n'.join(output_lines)
+        )
+
     def _sync_back_vars(self, modified_vars: Dict[str, Any], frame, func: Callable):
         if not modified_vars:
             return
@@ -970,10 +1185,15 @@ if __name__ == "__main__":
         if caller_frame is None:
             caller_frame = inspect.currentframe().f_back.f_back
 
-        captured_vars = self._extract_captured_vars(func, caller_frame)
+        sync_vars = getattr(self, 'sync_variables', True)
+
+        if sync_vars:
+            captured_vars = self._extract_captured_vars(func, caller_frame)
+        else:
+            captured_vars = {}
 
         # Merge in extra captured vars (for persistent namespace in Jupyter)
-        if extra_captured_vars:
+        if extra_captured_vars and sync_vars:
             captured_vars.update(extra_captured_vars)
 
         # Track if we connected in this call (vs. reusing existing connection)
@@ -992,7 +1212,8 @@ if __name__ == "__main__":
             if result.stderr:
                 print(result.stderr, file=sys.stderr, end='')
 
-            self._sync_back_vars(result.modified_vars, caller_frame, func)
+            if sync_vars:
+                self._sync_back_vars(result.modified_vars, caller_frame, func)
 
             if result.exception is not None:
                 raise result.exception
@@ -1049,6 +1270,7 @@ def remote(
     env: Optional[Dict[str, str]] = None,
     jupyter_mode: bool = False,
     jupyter_profile: str = 'default',
+    sync_variables: bool = True,
     _return_executor: bool = False,
 ) -> Callable:
     """
@@ -1082,6 +1304,10 @@ def remote(
         jupyter_profile: Profile name for Jupyter mode (default: 'default').
             Allows multiple remote connections. Use %%remotecell --profile <name>
             to execute on a specific profile.
+        sync_variables: If True (default), sync local variables to remote and
+            sync modified variables back. Set to False to prevent variable
+            syncing, which avoids pickling large objects (e.g. CUDA tensors)
+            that can cause timeouts.
 
     Examples:
         # As decorator - Single GPU execution (default)
@@ -1212,6 +1438,9 @@ def remote(
         env=env,
     )
 
+    # Store sync_variables setting on executor for remotecell magic
+    executor.sync_variables = sync_variables
+
     # Set global executor for notebook magic
     _global_executors[jupyter_profile] = executor
 
@@ -1315,6 +1544,20 @@ class RemoteCellMagic:
                     )
 
                 executor = _global_executors[profile_name]
+                sync_vars = getattr(executor, 'sync_variables', True)
+
+                # When sync_variables=False, use persistent session
+                # Variables persist in the remote Python REPL's namespace
+                if not sync_vars:
+                    try:
+                        if executor._persistent_shell is None:
+                            executor._start_persistent_session()
+                        return executor._execute_in_persistent_session(cell)
+                    except Exception as e:
+                        print(f"Error executing remote cell: {e}", file=sys.stderr)
+                        raise
+
+                # --- sync_variables=True path: pickle-based execution ---
 
                 # Get the IPython user namespace to pass as globals
                 ip = get_ipython()
